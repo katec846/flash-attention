@@ -2807,9 +2807,9 @@ def test_flash_attn_sm100_hdim256_seqused_paged_kv_fwd(
 def test_flash_attn_kvcache_fp8_dequant_sm90(num_splits, k_scale, v_scale, mha_type, q_dtype, causal):
     """SM90 fp16/bf16-Q + fp8-KV-cache Tensor Core paged forward (d=512).
 
-    fp16/bf16 Q and per-tensor FP8 (e4m3) paged K/V execute QK and PV with FP8 WGMMA.
-    Compensated FP8 pairs preserve Q and softmax-P accuracy without widening the
-    K/V operands to fp16. Per-(batch, kv_head) descales are folded by the kernel
+    Causal attention uses compensated FP8 QK/PV WGMMA. Non-causal attention
+    narrows Q and widens paged E4M3 K/V to FP16 for FP16 QK/PV WGMMA.
+    Per-(batch, kv_head) descales are folded by the kernel
     (q*k into the score scale, v into final output normalization/final_scale). The
     reference reads the exact paged FP8 bytes the kernel indexes (gathered through
     page_table, cast to fp16) and applies the same descales via attention_ref
