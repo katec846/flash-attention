@@ -2802,8 +2802,9 @@ def test_flash_attn_sm100_hdim256_seqused_paged_kv_fwd(
 @pytest.mark.parametrize("k_scale,v_scale", [(1.0, 1.0), (0.5, 0.25)])
 @pytest.mark.parametrize("num_splits", [1, 2])
 @pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_kvcache_fp8_dequant_sm90(num_splits, k_scale, v_scale, mha_type, q_dtype):
+def test_flash_attn_kvcache_fp8_dequant_sm90(num_splits, k_scale, v_scale, mha_type, q_dtype, causal):
     """SM90 fp16/bf16-Q + fp8-KV-cache Tensor Core paged forward (d=512).
 
     fp16/bf16 Q and per-tensor FP8 (e4m3) paged K/V execute QK and PV with FP8 WGMMA.
@@ -2816,7 +2817,7 @@ def test_flash_attn_kvcache_fp8_dequant_sm90(num_splits, k_scale, v_scale, mha_t
     partials combined back to the Q dtype). Q is not pre-quantized, so q_descale is
     identity (None on both sides). page_size must equal tile_n (64 for d=512 on SM90).
     """
-    device, d, page_size, causal = "cuda", 512, 64, True
+    device, d, page_size = "cuda", 512, 64
     batch_size, nheads, seqlen_q, seqlen_k = 2, 4, 5, 256
     nheads_k = nheads if mha_type == "mha" else 2
     torch.random.manual_seed(0)
@@ -5232,3 +5233,76 @@ def test_flash_attn_varlen_seqlen_k_per_split(causal):
     assert torch.equal(out_1024, first), (
         f"seqlen_k_per_split not batch-invariant: max_diff={max_diff}."
     )
+
+
+@pytest.mark.skipif(not IS_SM90, reason="SM90 FP8 KV fallback")
+@pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_splits", [1, 2, 32])
+@pytest.mark.parametrize("qhead_per_kvhead", [8, 16])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_kvcache_fp8_noncausal_dequant_output_lse_sm90(
+    q_dtype, num_splits, qhead_per_kvhead
+):
+    """DCP context must retain full-precision Q, all context keys, and mergeable LSE."""
+    d, page_size, num_kv_heads = 512, 64, 2
+    qheads = qhead_per_kvhead * num_kv_heads
+    cu_q = torch.tensor([0, 1, 6], dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([129, 257], dtype=torch.int32, device="cuda")
+    q = torch.zeros(6, qheads, d, dtype=q_dtype, device="cuda")
+    q[..., 0], q[..., 1] = 1024, 1152
+    # Strided physical cache pages, as in vLLM; logical pages are shuffled.
+    k_dense = torch.zeros(10, page_size, num_kv_heads, d, device="cuda", dtype=torch.float16)
+    v_dense = torch.zeros_like(k_dense)
+    pages = torch.tensor([[2, 0, 4, 1, 3], [7, 5, 9, 6, 8]], device="cuda", dtype=torch.int32)
+    k_dense[pages[:, 0].long(), 0, :, 0] = 1
+    k_dense[pages[:, 0].long(), 1, :, 1] = 1
+    v_dense[pages[:, 0].long(), 1] = 1
+    storage = torch.empty(10, 2, page_size, num_kv_heads, d, device="cuda", dtype=torch.float8_e4m3fn)
+    k, v = storage[:, 0], storage[:, 1]
+    k.copy_(k_dense); v.copy_(v_dense)
+    k_descale = torch.tensor([[0.5, 1.0], [1.0, 0.5]], dtype=torch.float32, device="cuda")
+    v_descale = torch.tensor([[0.25, 2.0], [2.0, 0.25]], dtype=torch.float32, device="cuda")
+    out, lse, *_ = _flash_attn_fwd(
+        q=q, k=k, v=v, cu_seqlens_q=cu_q, seqused_k=lengths,
+        max_seqlen_q=5, max_seqlen_k=257, page_table=pages,
+        causal=False, softmax_scale=1.0, num_splits=num_splits,
+        k_descale=k_descale, v_descale=v_descale, fp8_kv_dequant=True,
+        return_lse=True,
+    )
+    if is_fake_mode():
+        return
+    # QK logits are 1024, 1152, then zeros. Every query attends to token 1,
+    # even though every key lies in an earlier DCP context shard.
+    # FP8 Q saturation instead ties the first two logits and returns 0.5.
+    for seq, (start, end) in enumerate(((0, 1), (1, 6))):
+        expected_o = v_descale[seq].repeat_interleave(qhead_per_kvhead)[None, :, None].expand(end - start, qheads, d)
+        torch.testing.assert_close(out[start:end].float(), expected_o, rtol=0, atol=2e-3)
+        expected_lse = (1152 * k_descale[seq]).repeat_interleave(qhead_per_kvhead)[:, None].expand(qheads, end - start)
+        torch.testing.assert_close(lse[:, start:end], expected_lse, rtol=0, atol=2e-3)
+
+
+@pytest.mark.skipif(not IS_SM90, reason="SM90 FP8 KV fallback")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_kvcache_fp8_noncausal_lse_accuracy_sm90():
+    """Non-causal DCP LSE is checked on ordinary Q values against float64."""
+    torch.manual_seed(17)
+    q = torch.randn(1, 5, 16, 512, device="cuda", dtype=torch.bfloat16) * 0.25
+    k = torch.randn(65, 64, 2, 512, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    v = torch.randn(65, 64, 2, 512, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    pages = torch.randperm(65, device="cuda").to(torch.int32)[None]
+    lengths = torch.tensor([4099], device="cuda", dtype=torch.int32)
+    descale = torch.ones(1, 2, device="cuda", dtype=torch.float32)
+    out, lse, *_ = _flash_attn_fwd(
+        q=q, k=k, v=v, page_table=pages, seqused_k=lengths,
+        causal=False, softmax_scale=1.0, return_lse=True,
+        k_descale=descale, v_descale=descale,
+        num_splits=1, fp8_kv_dequant=True,
+    )
+    if is_fake_mode():
+        return
+    kr = k[pages[0].long()].reshape(-1, 2, 512)[:4099].double().repeat_interleave(8, dim=1)
+    vr = v[pages[0].long()].reshape(-1, 2, 512)[:4099].double().repeat_interleave(8, dim=1)
+    scores = torch.einsum("bqhd,khd->bhqk", q.double(), kr)
+    expected = torch.einsum("bhqk,khd->bqhd", scores.softmax(-1), vr)
+    torch.testing.assert_close(out.double(), expected, rtol=5e-3, atol=2e-3)
+    torch.testing.assert_close(lse.double(), scores.logsumexp(-1), rtol=0, atol=5e-4)

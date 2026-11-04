@@ -10,7 +10,8 @@ class NamedBarrierFwd(enum.IntEnum):
     WarpSchedulerWG3 = enum.auto()
     PFull = enum.auto()
     PEmpty = enum.auto()
-    # FP8-KV (flash_fwd_sm90.py): DequantK is unused; DequantV0/1 sync each WG's V half.
+    # FP8-KV: DequantK coordinates staging copies and shared-K reuse in the
+    # FP16-MMA fallback; DequantV0/1 sync each WG's V half.
     DequantK = enum.auto()
     DequantV0 = enum.auto()
     DequantV1 = enum.auto()

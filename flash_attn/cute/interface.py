@@ -713,7 +713,9 @@ def _flash_attn_fwd(
         compile_only: If True, compile the selected kernel and return without
             launching it.
         fp8_kv_dequant: SM90 only. fp16/bf16 Q with paged E4M3 K/V, head_dim 512,
-            page_size 64. Q is split into two E4M3 terms at a fixed scale of 1, so
+            page_size 64. Non-causal full attention dequantizes K/V to FP16 and
+            uses FP16 MMA. Causal/local attention uses FP8 MMA: Q is split into
+            two E4M3 terms at a fixed scale of 1, so
             the caller must keep |q| <= 448: above 448 the error grows about 10x,
             and above 896 Q saturates silently. Fold larger Q into k_descale.
     """
