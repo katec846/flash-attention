@@ -78,7 +78,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.fp8_mma = fp8_kv_dequant and (self.is_causal or self.is_local)
         # Split the FP8 QK sum in two; non-causal builds would serialize WGMMAs (ptxas C7511).
         self.qk_split = self.fp8_mma
-        assert not self.fp8_mma or self.mma_pv_is_rs, (
+        assert not self.fp8_kv_dequant or self.mma_pv_is_rs, (
             "SM90 FP8 KV dequant requires RS-mode PV because its shared storage "
             "does not allocate sP"
         )
